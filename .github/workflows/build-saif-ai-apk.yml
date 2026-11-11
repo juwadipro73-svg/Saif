@@ -161,12 +161,17 @@ jobs:
           grep -E "^(e:|w:) " /tmp/build.log || echo "(none)"
           echo
           echo "#### FAILED TASK / SUMMARY ####"
-          grep -E "^> Task .*FAILED|^FAILURE:|Execution failed for task|What went wrong|^Caused by:|BUILD FAILED" /tmp/build.log || true
+          grep -E "^> Task .*FAILED|^FAILURE:|Execution failed for task|What went wrong|^Caused by:|BUILD FAILED|\* Where:" /tmp/build.log || true
           echo
           echo "#### LAST 250 LINES ####"
           tail -250 /tmp/build.log || true
         } > ci-logs/compile-errors.txt || true
-        cat ci-logs/compile-errors.txt
+        grep -E "^e: |^> Task .*FAILED|^FAILURE:|Execution failed for task|What went wrong|^Caused by:|^\* " /tmp/build.log | head -45 | while IFS= read -r line; do
+          echo "::error::$line"
+        done
+        tail -40 /tmp/build.log | while IFS= read -r line; do
+          echo "::warning::$line"
+        done
 
     - name: Upload compile log
       if: failure()
