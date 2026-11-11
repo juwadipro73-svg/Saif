@@ -107,6 +107,7 @@ jobs:
           | grep -q '"isLoggedIn":true'
         curl -fsS http://127.0.0.1:18237/auth/status | grep -q '"email":"ci@saif.ai"'
         curl -fsS http://127.0.0.1:18237/projects | grep -q 'demo'
+        curl -fsS "http://127.0.0.1:18237/search?q=saif+workspace&dir=/tmp/saif-home/projects" | grep -q 'readme.txt'
         curl -fsS -X POST http://127.0.0.1:18237/search \
           -H "Content-Type: application/json" \
           -d '{"query":"saif workspace","path":"/tmp/saif-home/projects"}' \
