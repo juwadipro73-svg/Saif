@@ -184,9 +184,13 @@ jobs:
       shell: bash
       run: |
         set -euo pipefail
-        apk="$(find "$APP_DIR/app/build/outputs/apk" -name "*.apk" | head -n 1)"
+        apk="$(find "$APP_DIR/app/build/outputs/apk" -name "*standard-debug*.apk" | head -n 1)"
+        if [ -z "$apk" ]; then
+          apk="$(find "$APP_DIR/app/build/outputs/apk" -name "*.apk" | head -n 1)"
+        fi
         test -n "$apk" || { echo "::error::No APK was produced"; exit 1; }
         listing="$(unzip -l "$apk")"
+        echo "$listing" | grep -E "lib/|assets/legal|assets/licences" || true
         for required in \
           "lib/arm64-v8a/libsaifdaemon.so" \
           "lib/arm64-v8a/libproot.so" \
@@ -196,7 +200,11 @@ jobs:
           "assets/legal/THIRD_PARTY_NOTICES.md" \
           "assets/licences/JSCH_LICENSE.txt" \
           "assets/licences/WRITTEN_SOURCE_OFFER.txt"; do
-          echo "$listing" | grep -q "$required" || { echo "::error::Missing $required inside APK"; exit 1; }
+          echo "$listing" | grep -q "$required" || {
+            echo "::error::Missing $required inside APK ($apk)"
+            echo "$listing" | grep "lib/" | head -20 | while IFS= read -r l; do echo "::warning::$l"; done
+            exit 1
+          }
         done
         if echo "$listing" | grep -qi "jlatexmath"; then
           echo "::error::Unused jlatexmath artifact still present in APK"
