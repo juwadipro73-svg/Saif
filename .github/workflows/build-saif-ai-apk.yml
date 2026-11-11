@@ -1,0 +1,241 @@
+name: Build & Verify SAIF AI APK
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-saif-ai-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    env:
+      SAIF_CLOUD_API_BASE_URL: ${{ vars.SAIF_CLOUD_API_BASE_URL || secrets.SAIF_CLOUD_API_BASE_URL || '' }}
+      SAIF_DOWNLOAD_PORTAL_URL: ${{ vars.SAIF_DOWNLOAD_PORTAL_URL || secrets.SAIF_DOWNLOAD_PORTAL_URL || 'https://saifai-downloads.ai.studio' }}
+      SAIF_FIREBASE_DATABASE_URL: ${{ vars.SAIF_FIREBASE_DATABASE_URL || secrets.SAIF_FIREBASE_DATABASE_URL || 'https://saif-ai-2e541-default-rtdb.firebaseio.com' }}
+      SAIF_SOURCE_URL: https://github.com/${{ github.repository }}/tree/${{ github.sha }}
+
+    steps:
+    - name: Free disk space and add swap
+      shell: bash
+      run: |
+        sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL" || true
+        sudo swapoff -a || true
+        sudo fallocate -l 10G /mnt/swapfile
+        sudo chmod 600 /mnt/swapfile
+        sudo mkswap /mnt/swapfile
+        sudo swapon /mnt/swapfile
+        free -m
+        df -h / /mnt
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17 & 21
+      uses: actions/setup-java@v5
+      with:
+        distribution: 'temurin'
+        java-version: |
+          17
+          21
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Set up Go 1.24
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24'
+        cache: false
+
+    - name: Unpack SAIF AI source
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -rf saif-ai-source saif-outer
+        mkdir -p saif-ai-source
+        if [ -f "AALU.zip" ]; then
+          unzip -q AALU.zip -d saif-ai-source
+          cp AALU.zip "$RUNNER_TEMP/SAIF-AI-source.zip"
+        elif [ -f "SaifAI-Builder-arena-cb38509a-saifai-builder.zip" ]; then
+          mkdir -p saif-outer
+          unzip -q SaifAI-Builder-arena-cb38509a-saifai-builder.zip -d saif-outer
+          outer_dir="$(find saif-outer -maxdepth 2 -name AALU.zip | head -n 1)"
+          test -n "$outer_dir" || { echo "::error::AALU.zip not found inside outer zip"; exit 1; }
+          unzip -q "$outer_dir" -d saif-ai-source
+          cp SaifAI-Builder-arena-cb38509a-saifai-builder.zip "$RUNNER_TEMP/SAIF-AI-source.zip"
+        else
+          echo "::error::Neither AALU.zip nor SaifAI-Builder-arena-cb38509a-saifai-builder.zip found"
+          exit 1
+        fi
+        dir="$(find saif-ai-source -maxdepth 1 -mindepth 1 -type d | head -n 1)"
+        test -n "$dir" || { echo "::error::Unpacked archive does not contain project folder"; exit 1; }
+        test -f "$dir/settings.gradle.kts" || { echo "::error::$dir is not the Android project root"; exit 1; }
+        echo "APP_DIR=$dir" >> "$GITHUB_ENV"
+        echo "Unpacked project: $dir"
+
+    - name: Smoke-test Go workspace daemon (server.go)
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$APP_DIR/termux-daemon"
+        go build -trimpath -o /tmp/saifdaemon-host server.go
+        mkdir -p /tmp/saif-home/projects/demo
+        echo "hello from saif workspace" > /tmp/saif-home/projects/demo/readme.txt
+        /tmp/saifdaemon-host --port 18237 --home /tmp/saif-home >/tmp/daemon.log 2>&1 &
+        DAEMON_PID=$!
+        trap 'kill $DAEMON_PID 2>/dev/null || true' EXIT
+        for i in $(seq 1 25); do
+          if curl -fsS http://127.0.0.1:18237/ping >/dev/null 2>&1; then break; fi
+          sleep 0.2
+        done
+        curl -fsS http://127.0.0.1:18237/ping | grep -q '"ok":true'
+        curl -fsS http://127.0.0.1:18237/health | grep -q '"ok":true'
+        curl -fsS -X POST http://127.0.0.1:18237/auth/login \
+          -H "Content-Type: application/json" \
+          -d '{"email":"ci@saif.ai","fullName":"CI User","apiKey":"sk-ci-key","baseUrl":"https://api.example.com/v1","model":"gpt-4o"}' \
+          | grep -q '"isLoggedIn":true'
+        curl -fsS http://127.0.0.1:18237/auth/status | grep -q '"email":"ci@saif.ai"'
+        curl -fsS http://127.0.0.1:18237/projects | grep -q 'demo'
+        curl -fsS "http://127.0.0.1:18237/search?q=saif+workspace&dir=/tmp/saif-home/projects" | grep -q 'readme.txt'
+        curl -fsS -X POST http://127.0.0.1:18237/search \
+          -H "Content-Type: application/json" \
+          -d '{"query":"saif workspace","path":"/tmp/saif-home/projects"}' \
+          | grep -q 'readme.txt'
+        echo "Go workspace daemon passed all HTTP smoke checks."
+
+    - name: Licence provenance & header verification
+      shell: bash
+      run: |
+        set -euo pipefail
+        git clone --depth 1 -q https://github.com/Santoshkurmi/antigem.git /tmp/upstream-antigem
+        cd "$APP_DIR"
+        prov_out="$(python3 tools/licence/provenance.py --upstream /tmp/upstream-antigem)"
+        echo "$prov_out"
+        echo "$prov_out" | grep -E "identical +0 files"
+        echo "$prov_out" | grep -E "modified +0 files"
+        python3 tools/licence/add_saif_headers.py
+
+    - name: Pick a Gradle launcher
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$APP_DIR"
+        chmod +x gradlew || true
+        if ./gradlew --version >/dev/null 2>&1; then
+          echo "GRADLE=./gradlew" >> "$GITHUB_ENV"
+        else
+          echo "GRADLE=gradle" >> "$GITHUB_ENV"
+        fi
+
+    - name: Build debug APK
+      shell: bash
+      run: |
+        set -o pipefail
+        cd "$APP_DIR"
+        ( while true; do date +%T; free -m | awk 'NR==2||NR==3'; sleep 30; done ) > /tmp/mem.log 2>&1 &
+        $GRADLE :app:compileStandardDebugKotlin :app:compileStandardDebugJavaWithJavac \
+          --no-daemon --no-configuration-cache 2>&1 | tee /tmp/build.log
+        pkill -f KotlinCompileDaemon || true
+        sleep 3
+        free -m
+        $GRADLE :app:assembleStandardDebug --no-daemon --no-configuration-cache 2>&1 | tee -a /tmp/build.log
+
+    - name: Publish compile errors on failure
+      if: failure()
+      shell: bash
+      run: |
+        mkdir -p ci-logs
+        {
+          echo "#### e:/w: LINES ####"
+          grep -E "^(e:|w:) " /tmp/build.log || echo "(none)"
+          echo
+          echo "#### FAILED TASK / SUMMARY ####"
+          grep -E "^> Task .*FAILED|^FAILURE:|Execution failed for task|What went wrong|^Caused by:|BUILD FAILED|\* Where:" /tmp/build.log || true
+          echo
+          echo "#### LAST 250 LINES ####"
+          tail -250 /tmp/build.log || true
+        } > ci-logs/compile-errors.txt || true
+        grep -E "^e: |^> Task .*FAILED|^FAILURE:|Execution failed for task|What went wrong|^Caused by:|^\* " /tmp/build.log | head -45 | while IFS= read -r line; do
+          echo "::error::$line"
+        done
+        tail -40 /tmp/build.log | while IFS= read -r line; do
+          echo "::warning::$line"
+        done
+
+    - name: Upload compile log
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: saif-ai-compile-log
+        path: ci-logs/compile-errors.txt
+
+    - name: Verify APK native binaries & bundled legal notices
+      shell: bash
+      run: |
+        set -euo pipefail
+        apk="$(find "$APP_DIR/app/build/outputs/apk" -name "*.apk" | head -n 1)"
+        test -n "$apk" || { echo "::error::No APK was produced"; exit 1; }
+        listing="$(unzip -l "$apk")"
+        for required in \
+          "lib/arm64-v8a/libsaifdaemon.so" \
+          "lib/arm64-v8a/libproot.so" \
+          "lib/arm64-v8a/libprootloader.so" \
+          "lib/arm64-v8a/libtalloc.so" \
+          "assets/legal/LICENSE" \
+          "assets/legal/THIRD_PARTY_NOTICES.md" \
+          "assets/licences/JSCH_LICENSE.txt" \
+          "assets/licences/WRITTEN_SOURCE_OFFER.txt"; do
+          echo "$listing" | grep -q "$required" || { echo "::error::Missing $required inside APK"; exit 1; }
+        done
+        if echo "$listing" | grep -qi "jlatexmath"; then
+          echo "::error::Unused jlatexmath artifact still present in APK"
+          exit 1
+        fi
+        cp "$apk" "$RUNNER_TEMP/SAIF-AI-debug.apk"
+        cp "$APP_DIR/SAIF_AI_OWNERSHIP_AND_RELICENSING.md" "$RUNNER_TEMP/SAIF_AI_OWNERSHIP_AND_RELICENSING.md"
+        echo "APK_PATH=$RUNNER_TEMP/SAIF-AI-debug.apk" >> "$GITHUB_ENV"
+        ls -lh "$RUNNER_TEMP/SAIF-AI-debug.apk" "$RUNNER_TEMP/SAIF-AI-source.zip" "$RUNNER_TEMP/SAIF_AI_OWNERSHIP_AND_RELICENSING.md"
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: SAIF-AI-deliverables
+        path: |
+          ${{ runner.temp }}/SAIF-AI-debug.apk
+          ${{ runner.temp }}/SAIF-AI-source.zip
+          ${{ runner.temp }}/SAIF_AI_OWNERSHIP_AND_RELICENSING.md
+
+    - name: Publish public release deliverables
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        tag="saif-ai-v2.0"
+        note="Verified SAIF AI v2.0 build from branch \`${GITHUB_REF_NAME}\` (commit \`${GITHUB_SHA}\`). Includes built Android APK, complete source archive, and Ownership & Relicensing document."
+        if gh release view "$tag" >/dev/null 2>&1; then
+          gh release upload "$tag" \
+            "$RUNNER_TEMP/SAIF-AI-debug.apk" \
+            "$RUNNER_TEMP/SAIF-AI-source.zip" \
+            "$RUNNER_TEMP/SAIF_AI_OWNERSHIP_AND_RELICENSING.md" \
+            --clobber
+          gh release edit "$tag" --title "SAIF AI v2.0 — Verified Build, Source & Licensing" --notes "$note"
+        else
+          gh release create "$tag" \
+            "$RUNNER_TEMP/SAIF-AI-debug.apk" \
+            "$RUNNER_TEMP/SAIF-AI-source.zip" \
+            "$RUNNER_TEMP/SAIF_AI_OWNERSHIP_AND_RELICENSING.md" \
+            --title "SAIF AI v2.0 — Verified Build, Source & Licensing" \
+            --notes "$note"
+        fi
